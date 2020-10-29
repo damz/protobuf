@@ -49,6 +49,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gogo/protobuf/proto"
@@ -81,6 +82,25 @@ type Marshaler struct {
 	// fully-qualified type name from the type URL and pass that to
 	// proto.MessageType(string).
 	AnyResolver AnyResolver
+
+	propertiesCache propertiesCache
+}
+
+type propertiesCache struct {
+	m     sync.Mutex
+	cache map[structFieldKey]structFieldProperties
+}
+
+type structFieldKey struct {
+	typ reflect.Type
+	idx int
+}
+
+type structFieldProperties struct {
+	isProto       bool
+	protoTag      string
+	protoOneOfTag string
+	properties    proto.Properties
 }
 
 // AnyResolver takes a type URL, present in an Any message, and resolves it into
@@ -131,7 +151,7 @@ func (m *Marshaler) Marshal(out io.Writer, pb proto.Message) error {
 		return errors.New("Marshal called with nil")
 	}
 	// Check for unset required fields first.
-	if err := checkRequiredFields(pb); err != nil {
+	if err := checkRequiredFields(pb, &m.propertiesCache); err != nil {
 		return err
 	}
 	writer := &errWriter{writer: out}
@@ -211,7 +231,7 @@ func (m *Marshaler) marshalObject(out *errWriter, v proto.Message, indent, typeU
 			// "Wrappers use the same representation in JSON
 			//  as the wrapped primitive type, ..."
 			sprop := proto.GetProperties(s.Type())
-			return m.marshalValue(out, sprop.Prop[0], s.Field(0), indent)
+			return m.marshalValue(out, *sprop.Prop[0], s.Field(0), indent)
 		case "Any":
 			// Any is a bit more involved.
 			return m.marshalAny(out, v, indent)
@@ -246,7 +266,7 @@ func (m *Marshaler) marshalObject(out *errWriter, v proto.Message, indent, typeU
 		case "Struct", "ListValue":
 			// Let marshalValue handle the `Struct.fields` map or the `ListValue.values` slice.
 			// TODO: pass the correct Properties if needed.
-			return m.marshalValue(out, &proto.Properties{}, s.Field(0), indent)
+			return m.marshalValue(out, proto.Properties{}, s.Field(0), indent)
 		case "Timestamp":
 			// "RFC 3339, where generated output will always be Z-normalized
 			//  and uses 0, 3, 6 or 9 fractional digits."
@@ -274,7 +294,7 @@ func (m *Marshaler) marshalObject(out *errWriter, v proto.Message, indent, typeU
 			// oneof -> *T -> T -> T.F
 			x := kind.Elem().Elem().Field(0)
 			// TODO: pass the correct Properties if needed.
-			return m.marshalValue(out, &proto.Properties{}, x, indent)
+			return m.marshalValue(out, proto.Properties{}, x, indent)
 		}
 	}
 
@@ -292,15 +312,17 @@ func (m *Marshaler) marshalObject(out *errWriter, v proto.Message, indent, typeU
 		firstField = false
 	}
 
+	typ := s.Type()
 	for i := 0; i < s.NumField(); i++ {
 		value := s.Field(i)
-		valueField := s.Type().Field(i)
+		valueField := typ.Field(i)
 		if strings.HasPrefix(valueField.Name, "XXX_") {
 			continue
 		}
 
 		//this is not a protobuf field
-		if valueField.Tag.Get("protobuf") == "" && valueField.Tag.Get("protobuf_oneof") == "" {
+		entry := m.propertiesCache.get(typ, i)
+		if !entry.isProto {
 			continue
 		}
 
@@ -342,13 +364,18 @@ func (m *Marshaler) marshalObject(out *errWriter, v proto.Message, indent, typeU
 		}
 
 		// Oneof fields need special handling.
-		if valueField.Tag.Get("protobuf_oneof") != "" {
+		if entry.protoOneOfTag != "" {
 			// value is an interface containing &T{real_value}.
 			sv := value.Elem().Elem() // interface -> *T -> T
 			value = sv.Field(0)
 			valueField = sv.Type().Field(0)
+			entry = m.propertiesCache.get(sv.Type(), 0)
 		}
-		prop := jsonProperties(valueField, m.OrigName)
+
+		prop := entry.properties
+		if m.OrigName {
+			prop.JSONName = prop.OrigName
+		}
 		if !firstField {
 			m.writeSep(out)
 		}
@@ -403,7 +430,7 @@ func (m *Marshaler) marshalObject(out *errWriter, v proto.Message, indent, typeU
 			if !firstField {
 				m.writeSep(out)
 			}
-			if err := m.marshalField(out, &prop, value, indent); err != nil {
+			if err := m.marshalField(out, prop, value, indent); err != nil {
 				return err
 			}
 			firstField = false
@@ -499,7 +526,7 @@ func (m *Marshaler) marshalTypeURL(out *errWriter, indent, typeURL string) error
 }
 
 // marshalField writes field description and value to the Writer.
-func (m *Marshaler) marshalField(out *errWriter, prop *proto.Properties, v reflect.Value, indent string) error {
+func (m *Marshaler) marshalField(out *errWriter, prop proto.Properties, v reflect.Value, indent string) error {
 	if m.Indent != "" {
 		out.write(indent)
 		out.write(m.Indent)
@@ -517,7 +544,7 @@ func (m *Marshaler) marshalField(out *errWriter, prop *proto.Properties, v refle
 }
 
 // marshalValue writes the value to the Writer.
-func (m *Marshaler) marshalValue(out *errWriter, prop *proto.Properties, v reflect.Value, indent string) error {
+func (m *Marshaler) marshalValue(out *errWriter, prop proto.Properties, v reflect.Value, indent string) error {
 
 	v = reflect.Indirect(v)
 
@@ -697,8 +724,8 @@ func (m *Marshaler) marshalValue(out *errWriter, prop *proto.Properties, v refle
 			}
 
 			vprop := prop
-			if prop != nil && prop.MapValProp != nil {
-				vprop = prop.MapValProp
+			if prop.MapValProp != nil {
+				vprop = *prop.MapValProp
 			}
 			if err := m.marshalValue(out, vprop, v.MapIndex(k), indent+m.Indent); err != nil {
 				return err
@@ -772,7 +799,7 @@ func (u *Unmarshaler) UnmarshalNext(dec *json.Decoder, pb proto.Message) error {
 	if err := u.unmarshalValue(reflect.ValueOf(pb).Elem(), inputValue, nil); err != nil {
 		return err
 	}
-	return checkRequiredFields(pb)
+	return checkRequiredFields(pb, nil)
 }
 
 // Unmarshal unmarshals a JSON object stream into a protocol
@@ -1238,13 +1265,46 @@ func unquote(s string) (string, error) {
 }
 
 // jsonProperties returns parsed proto.Properties for the field and corrects JSONName attribute.
-func jsonProperties(f reflect.StructField, origName bool) *proto.Properties {
+func (c *propertiesCache) get(t reflect.Type, idx int) structFieldProperties {
+	key := structFieldKey{
+		typ: t,
+		idx: idx,
+	}
+
+	if c != nil {
+		c.m.Lock()
+		defer c.m.Unlock()
+
+		if prop, ok := c.cache[key]; ok {
+			return prop
+		}
+
+		if c.cache == nil {
+			c.cache = make(map[structFieldKey]structFieldProperties)
+		}
+	}
+
+	f := t.Field(idx)
+
+	protoTag := f.Tag.Get("protobuf")
+	protoOneOfTag := f.Tag.Get("protobuf_oneof")
+
 	var prop proto.Properties
-	prop.Init(f.Type, f.Name, f.Tag.Get("protobuf"), &f)
-	if origName || prop.JSONName == "" {
+	prop.Init(f.Type, f.Name, protoTag, &f)
+	if prop.JSONName == "" {
 		prop.JSONName = prop.OrigName
 	}
-	return &prop
+
+	entry := structFieldProperties{
+		isProto:       protoTag != "" || protoOneOfTag != "",
+		protoTag:      protoTag,
+		protoOneOfTag: protoOneOfTag,
+		properties:    prop,
+	}
+	if c != nil {
+		c.cache[key] = entry
+	}
+	return entry
 }
 
 type fieldNames struct {
@@ -1300,7 +1360,7 @@ func (s mapKeys) Less(i, j int) bool {
 // checkRequiredFields returns an error if any required field in the given proto message is not set.
 // This function is used by both Marshal and Unmarshal.  While required fields only exist in a
 // proto2 message, a proto3 message can contain proto2 message(s).
-func checkRequiredFields(pb proto.Message) error {
+func checkRequiredFields(pb proto.Message, cache *propertiesCache) error {
 	// Most well-known type messages do not contain required fields.  The "Any" type may contain
 	// a message that has required fields.
 	//
@@ -1325,9 +1385,10 @@ func checkRequiredFields(pb proto.Message) error {
 		return nil
 	}
 
+	typ := v.Type()
 	for i := 0; i < v.NumField(); i++ {
 		field := v.Field(i)
-		sfield := v.Type().Field(i)
+		sfield := typ.Field(i)
 
 		if sfield.PkgPath != "" {
 			// blank PkgPath means the field is exported; skip if not exported
@@ -1338,9 +1399,11 @@ func checkRequiredFields(pb proto.Message) error {
 			continue
 		}
 
+		item := cache.get(typ, i)
+
 		// Oneof field is an interface implemented by wrapper structs containing the actual oneof
 		// field, i.e. an interface containing &T{real_value}.
-		if sfield.Tag.Get("protobuf_oneof") != "" {
+		if item.protoOneOfTag != "" {
 			if field.Kind() != reflect.Interface {
 				continue
 			}
@@ -1354,14 +1417,10 @@ func checkRequiredFields(pb proto.Message) error {
 			}
 			field = v.Field(0)
 			sfield = v.Type().Field(0)
+			item = cache.get(v.Type(), 0)
 		}
 
-		protoTag := sfield.Tag.Get("protobuf")
-		if protoTag == "" {
-			continue
-		}
-		var prop proto.Properties
-		prop.Init(sfield.Type, sfield.Name, protoTag, &sfield)
+		prop := item.properties
 
 		switch field.Kind() {
 		case reflect.Map:
@@ -1372,7 +1431,7 @@ func checkRequiredFields(pb proto.Message) error {
 			keys := field.MapKeys()
 			for _, k := range keys {
 				v := field.MapIndex(k)
-				if err := checkRequiredFieldsInValue(v); err != nil {
+				if err := checkRequiredFieldsInValue(v, cache); err != nil {
 					return err
 				}
 			}
@@ -1392,7 +1451,7 @@ func checkRequiredFields(pb proto.Message) error {
 			// Check each slice item.
 			for i := 0; i < field.Len(); i++ {
 				v := field.Index(i)
-				if err := checkRequiredFieldsInValue(v); err != nil {
+				if err := checkRequiredFieldsInValue(v, cache); err != nil {
 					return err
 				}
 			}
@@ -1403,7 +1462,7 @@ func checkRequiredFields(pb proto.Message) error {
 				}
 				continue
 			}
-			if err := checkRequiredFieldsInValue(field); err != nil {
+			if err := checkRequiredFieldsInValue(field, cache); err != nil {
 				return err
 			}
 		}
@@ -1418,7 +1477,7 @@ func checkRequiredFields(pb proto.Message) error {
 		if err != nil {
 			return err
 		}
-		err = checkRequiredFieldsInValue(reflect.ValueOf(ep))
+		err = checkRequiredFieldsInValue(reflect.ValueOf(ep), cache)
 		if err != nil {
 			return err
 		}
@@ -1427,9 +1486,9 @@ func checkRequiredFields(pb proto.Message) error {
 	return nil
 }
 
-func checkRequiredFieldsInValue(v reflect.Value) error {
+func checkRequiredFieldsInValue(v reflect.Value, cache *propertiesCache) error {
 	if v.Type().Implements(messageType) {
-		return checkRequiredFields(v.Interface().(proto.Message))
+		return checkRequiredFields(v.Interface().(proto.Message), cache)
 	}
 	return nil
 }
